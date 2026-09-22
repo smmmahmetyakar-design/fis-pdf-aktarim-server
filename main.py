@@ -70,9 +70,11 @@ class ReceiptProcessor:
 
     def _parse_text(self, text: str, source: str) -> Dict | None:
         receipt = {field: '' for field in CSV_HEADERS}
-        print(f"DEBUG: Processing {source}")
-        print(f"DEBUG: Text length: {len(text)}")
-        print(f"DEBUG: First 500 chars: {text[:500]}")
+        print(f"\n{'='*60}")
+        print(f"DEBUG: {source}")
+        print(f"Length: {len(text)} chars")
+        print(f"Full text:\n{text}")
+        print(f"{'='*60}\n")
         
         field_count = 0
         

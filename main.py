@@ -22,7 +22,7 @@ import re
 # Try to import OCR
 try:
     import pytesseract
-    from PIL import Image, ImageOps, ImageFilter
+    from PIL import Image
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
@@ -86,11 +86,7 @@ class ReceiptProcessor:
                     return
 
                 try:
-                    # Higher DPI (300 instead of the pdf2image default of
-                    # ~200) gives Tesseract more pixels per character to
-                    # work with on small thermal-receipt print, reducing
-                    # digit confusions like 1/9/7 or 0/6/8.
-                    images = convert_from_path(file_path, dpi=300)
+                    images = convert_from_path(file_path)
                 except Exception as e:
                     self.skipped.append((filename, f"Failed to convert PDF: {str(e)[:50]}"))
                     return
@@ -101,11 +97,7 @@ class ReceiptProcessor:
 
                 total_pages = len(images)
                 for page_num, image in enumerate(images, start=1):
-                    page_text = pytesseract.image_to_string(
-                        self._preprocess_for_ocr(image),
-                        lang='tur+eng',
-                        config='--psm 6'
-                    )
+                    page_text = pytesseract.image_to_string(image, lang='tur+eng')
                     if total_pages > 1:
                         page_label = f"{filename} (sayfa {page_num}/{total_pages})"
                     else:
@@ -113,41 +105,11 @@ class ReceiptProcessor:
                     self._process_page_text(page_text, page_label)
             else:
                 image = Image.open(file_path)
-                text = pytesseract.image_to_string(
-                    self._preprocess_for_ocr(image),
-                    lang='tur+eng',
-                    config='--psm 6'
-                )
+                text = pytesseract.image_to_string(image, lang='tur+eng')
                 self._process_page_text(text, filename)
 
         except Exception as e:
             self.skipped.append((filename, f"Error: {str(e)[:50]}"))
-
-    def _preprocess_for_ocr(self, image):
-        """
-        Improve OCR accuracy on typically small, low-contrast, and often
-        crumpled/blurry thermal-receipt photos: upscale, convert to
-        grayscale, stretch contrast, and lightly sharpen before handing to
-        Tesseract. This targets exactly the kind of digit confusion seen in
-        practice (1/7, 0/6/8/9) that no amount of regex tuning can recover
-        once the wrong character has already been read.
-        """
-        try:
-            width, height = image.size
-            if max(width, height) < 2000:
-                scale = 2000 / max(width, height)
-                image = image.resize(
-                    (int(width * scale), int(height * scale)),
-                    Image.LANCZOS
-                )
-            gray = ImageOps.grayscale(image)
-            gray = ImageOps.autocontrast(gray, cutoff=1)
-            gray = gray.filter(ImageFilter.SHARPEN)
-            return gray
-        except Exception:
-            # If preprocessing itself fails for any reason, fall back to
-            # the original image rather than losing the whole page.
-            return image
 
     def _process_page_text(self, text: str, label: str) -> None:
         """Parse the OCR text of ONE page/image as ONE receipt and record the result."""

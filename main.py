@@ -185,8 +185,15 @@ class ReceiptProcessor:
         # since that appears EARLIER in the text (in the header/address
         # block) than the real "FİŞ NO" line, a naive re.search() for a
         # bare "No" alternative would grab the address number instead.
+        # Require digits only for the captured value here: on some receipts
+        # OCR reading order puts an unrelated label ("SAAT 16:28") right
+        # after "Fiş No:" instead of the actual number (which prints
+        # further down/right on the physical receipt), and a permissive
+        # [A-Za-z0-9]+ capture would grab that unrelated word instead of
+        # failing cleanly and falling through to the digit-only fallbacks
+        # below.
         no_match = re.search(
-            r'(?:Belge\s*No|Evrak\s*No|Fi[şs]\s*No)[:\s]*([A-Za-z0-9\-]{2,20})',
+            r'(?:Belge\s*No|Evrak\s*No|Fi[şs]\s*No)[:\s]*(\d{2,10})',
             text, re.IGNORECASE
         )
         if no_match:
@@ -194,15 +201,40 @@ class ReceiptProcessor:
             field_count += 1
             found_fields.append('EVRAK NO')
         else:
-            # Fallback 1: a bare "No" keyword, but skip it if what follows
-            # looks like part of an address (contains a "/", as in "52/206")
-            no_bare = re.search(r'\bNo[:\s]*([A-Za-z0-9\-/]{2,20})', text, re.IGNORECASE)
-            if no_bare and '/' not in no_bare.group(1):
-                receipt['EVRAK NO'] = no_bare.group(1).strip()
-                field_count += 1
-                found_fields.append('EVRAK NO')
-            else:
-                # Fallback 2: look for a standalone 3-8 digit number
+            # Fallback 1: the "Fiş/Evrak/Belge No" keyword was found, but not
+            # immediately followed by digits - OCR reading order sometimes
+            # puts an unrelated label ("SAAT 16:28") right after it instead,
+            # with the real number printed a bit further down/right. Search
+            # a nearby window after the keyword instead of the whole
+            # document (which risks grabbing a phone number or address
+            # number that happens to appear earlier in the text). Require
+            # 3+ digits and reject anything glued to a ":" so a time like
+            # "16:28" (2-digit components) is never mistaken for it.
+            found_no = False
+            kw_match = re.search(r'(?:Belge|Evrak|Fi[şs])\s*No', text, re.IGNORECASE)
+            if kw_match:
+                window = text[kw_match.end():kw_match.end() + 80]
+                for cand in re.finditer(r'(?<![:\d])(\d{3,8})(?![:\d])', window):
+                    receipt['EVRAK NO'] = cand.group(1)
+                    field_count += 1
+                    found_fields.append('EVRAK NO')
+                    found_no = True
+                    break
+
+            if not found_no:
+                # Fallback 2: a bare "No" keyword, but skip it if what
+                # follows looks like part of an address (contains "/", as
+                # in "52/206")
+                no_bare = re.search(r'\bNo[:\s]*([A-Za-z0-9\-/]{2,20})', text, re.IGNORECASE)
+                if no_bare and '/' not in no_bare.group(1):
+                    receipt['EVRAK NO'] = no_bare.group(1).strip()
+                    field_count += 1
+                    found_fields.append('EVRAK NO')
+                    found_no = True
+
+            if not found_no:
+                # Fallback 3 (last resort): a standalone 3-8 digit number
+                # anywhere in the document
                 no_fallback = re.search(r'(?:^|\s)(\d{3,8})(?:\s|$)', text, re.MULTILINE)
                 if no_fallback:
                     receipt['EVRAK NO'] = no_fallback.group(1)

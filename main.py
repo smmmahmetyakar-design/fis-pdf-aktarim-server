@@ -959,7 +959,7 @@ HTML_TEMPLATE = """
                 detailsHtml += '<div class="skipped-list"><strong>Çıkarılan fişler:</strong>';
                 summary.extracted_details.forEach(item => {
                     const vals = Object.entries(item.values).map(([k, v]) => `${k}: ${v}`).join(', ');
-                    detailsHtml += `<div class="skipped-item" style="border-left-color:#4CAF50"><strong>${item.file}</strong> (${item.field_count}/9): ${vals}</div>`;
+                    detailsHtml += `<div class="skipped-item" style="border-left-color:#4CAF50"><strong>${item.file}</strong> (${item.field_count}/9): ${vals}<br><span style="color:#999;font-size:11px">OCR: "${item.ocr_preview}"</span></div>`;
                 });
                 detailsHtml += '</div>';
             }

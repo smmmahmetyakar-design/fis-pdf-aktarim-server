@@ -70,6 +70,10 @@ class ReceiptProcessor:
 
     def _parse_text(self, text: str, source: str) -> Dict | None:
         receipt = {field: '' for field in CSV_HEADERS}
+        print(f"DEBUG: Processing {source}")
+        print(f"DEBUG: Text length: {len(text)}")
+        print(f"DEBUG: First 500 chars: {text[:500]}")
+        
         field_count = 0
         
         date_match = re.search(r'\b(\d{1,2})[./\-](\d{1,2})[./\-](\d{4})\b', text)

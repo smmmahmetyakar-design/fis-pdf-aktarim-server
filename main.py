@@ -22,7 +22,7 @@ import re
 # Try to import OCR
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageOps, ImageFilter
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
@@ -86,7 +86,11 @@ class ReceiptProcessor:
                     return
 
                 try:
-                    images = convert_from_path(file_path)
+                    # Higher DPI (300 instead of the pdf2image default of
+                    # ~200) gives Tesseract more pixels per character to
+                    # work with on small thermal-receipt print, reducing
+                    # digit confusions like 1/9/7 or 0/6/8.
+                    images = convert_from_path(file_path, dpi=300)
                 except Exception as e:
                     self.skipped.append((filename, f"Failed to convert PDF: {str(e)[:50]}"))
                     return
@@ -97,7 +101,11 @@ class ReceiptProcessor:
 
                 total_pages = len(images)
                 for page_num, image in enumerate(images, start=1):
-                    page_text = pytesseract.image_to_string(image, lang='tur+eng')
+                    page_text = pytesseract.image_to_string(
+                        self._preprocess_for_ocr(image),
+                        lang='tur+eng',
+                        config='--psm 6'
+                    )
                     if total_pages > 1:
                         page_label = f"{filename} (sayfa {page_num}/{total_pages})"
                     else:
@@ -105,11 +113,41 @@ class ReceiptProcessor:
                     self._process_page_text(page_text, page_label)
             else:
                 image = Image.open(file_path)
-                text = pytesseract.image_to_string(image, lang='tur+eng')
+                text = pytesseract.image_to_string(
+                    self._preprocess_for_ocr(image),
+                    lang='tur+eng',
+                    config='--psm 6'
+                )
                 self._process_page_text(text, filename)
 
         except Exception as e:
             self.skipped.append((filename, f"Error: {str(e)[:50]}"))
+
+    def _preprocess_for_ocr(self, image):
+        """
+        Improve OCR accuracy on typically small, low-contrast, and often
+        crumpled/blurry thermal-receipt photos: upscale, convert to
+        grayscale, stretch contrast, and lightly sharpen before handing to
+        Tesseract. This targets exactly the kind of digit confusion seen in
+        practice (1/7, 0/6/8/9) that no amount of regex tuning can recover
+        once the wrong character has already been read.
+        """
+        try:
+            width, height = image.size
+            if max(width, height) < 2000:
+                scale = 2000 / max(width, height)
+                image = image.resize(
+                    (int(width * scale), int(height * scale)),
+                    Image.LANCZOS
+                )
+            gray = ImageOps.grayscale(image)
+            gray = ImageOps.autocontrast(gray, cutoff=1)
+            gray = gray.filter(ImageFilter.SHARPEN)
+            return gray
+        except Exception:
+            # If preprocessing itself fails for any reason, fall back to
+            # the original image rather than losing the whole page.
+            return image
 
     def _process_page_text(self, text: str, label: str) -> None:
         """Parse the OCR text of ONE page/image as ONE receipt and record the result."""
@@ -178,19 +216,36 @@ class ReceiptProcessor:
             field_count += 1
             found_fields.append('TCKN/VKN')
 
-        # Pattern 3: Receipt number (often alphanumeric after "Belge No", "Evrak No", "No:", etc.)
-        no_match = re.search(r'(?:Belge No|Evrak No|No|Fiş No)[:\s]+([A-Za-z0-9\-]{2,20})', text, re.IGNORECASE)
+        # Pattern 3: Receipt number. Try SPECIFIC, reliable labels first
+        # ("Fiş No", "Fis No" - OCR often drops the cedilla, "Evrak No",
+        # "Belge No"). A bare "No" is tried only as a last resort, because
+        # it also matches an address street number like "NO:52/206" - and
+        # since that appears EARLIER in the text (in the header/address
+        # block) than the real "FİŞ NO" line, a naive re.search() for a
+        # bare "No" alternative would grab the address number instead.
+        no_match = re.search(
+            r'(?:Belge\s*No|Evrak\s*No|Fi[şs]\s*No)[:\s]*([A-Za-z0-9\-]{2,20})',
+            text, re.IGNORECASE
+        )
         if no_match:
             receipt['EVRAK NO'] = no_match.group(1).strip()
             field_count += 1
             found_fields.append('EVRAK NO')
         else:
-            # Fallback: look for 4-6 digit number
-            no_fallback = re.search(r'(?:^|\s)(\d{3,8})(?:\s|$)', text, re.MULTILINE)
-            if no_fallback:
-                receipt['EVRAK NO'] = no_fallback.group(1)
+            # Fallback 1: a bare "No" keyword, but skip it if what follows
+            # looks like part of an address (contains a "/", as in "52/206")
+            no_bare = re.search(r'\bNo[:\s]*([A-Za-z0-9\-/]{2,20})', text, re.IGNORECASE)
+            if no_bare and '/' not in no_bare.group(1):
+                receipt['EVRAK NO'] = no_bare.group(1).strip()
                 field_count += 1
                 found_fields.append('EVRAK NO')
+            else:
+                # Fallback 2: look for a standalone 3-8 digit number
+                no_fallback = re.search(r'(?:^|\s)(\d{3,8})(?:\s|$)', text, re.MULTILINE)
+                if no_fallback:
+                    receipt['EVRAK NO'] = no_fallback.group(1)
+                    field_count += 1
+                    found_fields.append('EVRAK NO')
 
         # Pattern 4: Vendor name - typically appears early in receipt
         # Look for lines with company/shop names (usually after header/date)
@@ -219,14 +274,28 @@ class ReceiptProcessor:
         # (1234,56 - no thousands separator at all, common on smaller
         # receipts). Allows a stray OCR space before the decimals, e.g.
         # "650, 00".
-        AMOUNT_TOKEN = r'(?:\d{1,3}(?:\.\d{3})+,\s?\d{2}|\d{1,6},\s?\d{2})'
+        # The trailing (?!\d) is critical: without it, a number like
+        # "48,900" (which is really 48.900 with the thousands DOT misread
+        # as a comma by OCR) gets wrongly truncated to a "valid-looking"
+        # match "48,90" by grabbing only the first 2 of the 3 digits after
+        # the comma. Rejecting any match immediately followed by another
+        # digit forces us to correctly recognize this as NOT a clean
+        # decimal amount, rather than silently extracting the wrong value.
+        AMOUNT_TOKEN = r'(?:\d{1,3}(?:\.\d{3})+,\s?\d{2}|\d{1,6},\s?\d{2})(?!\d)'
         # KDV is frequently OCR'd as "KDY", "KOV", or with a stray space
         # inserted inside it ("K DY") on blurry/crumpled thermal receipts.
         KDV_KW = r'K\s*D\s*[VY]|VAT|Vergi'
         # TOPLAM is frequently truncated/garbled down to just "TOP".
         TOPLAM_KW = r'Genel\s*Toplam|TOPLAM\s*TUTAR|Toplam|Total|TOP\b'
 
-        amount_pattern = rf'(?:Tutar|Ara\s*Toplam)[^\d]{{0,8}}({AMOUNT_TOKEN})'
+        # NOTE: deliberately NOT matching "Ara Toplam" here. On some
+        # receipts "ARATOPLAM" is the VAT-INCLUSIVE subtotal (same value as
+        # TOP/TOPLAM), not the pre-tax base - treating it as TUTAR caused
+        # TUTAR to wrongly equal TOPLAM, blocking the KDV reconciliation
+        # below from ever subtracting the tax out. Only an explicit
+        # "Tutar" label is trusted for the pre-tax amount; otherwise it's
+        # derived from TOPLAM - KDV further down.
+        amount_pattern = rf'(?:Tutar)[^\d]{{0,8}}({AMOUNT_TOKEN})'
         amount_matches = re.findall(amount_pattern, text, re.IGNORECASE)
 
         total_pattern = rf'(?:{TOPLAM_KW})[^\d]{{0,8}}({AMOUNT_TOKEN})'

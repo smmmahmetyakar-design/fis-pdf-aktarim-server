@@ -65,65 +65,81 @@ class ReceiptProcessor:
     def __init__(self):
         self.receipts: List[Dict] = []
         self.skipped: List[Tuple[str, str]] = []
+        self.extraction_notes: List[Dict] = []
 
     def process_file(self, file_path: str, filename: str) -> None:
-        """Process a single receipt file (image or PDF)."""
+        """
+        Process a single uploaded file. A PDF may contain MULTIPLE separate
+        receipts/invoices (one per page) - each page is OCR'd and parsed as
+        its OWN receipt row. Combining all pages into one blob of text before
+        parsing was the earlier bug: it mixed numbers from different receipts
+        together into garbage values.
+        """
         try:
             if not HAS_OCR:
                 self.skipped.append((filename, "OCR not available - install pytesseract"))
                 return
 
-            # Check if it's a PDF
             if filename.lower().endswith('.pdf'):
                 if not HAS_PDF:
                     self.skipped.append((filename, "PDF support not available - install pdf2image"))
                     return
-                
-                # Convert PDF to images
+
                 try:
                     images = convert_from_path(file_path)
                 except Exception as e:
                     self.skipped.append((filename, f"Failed to convert PDF: {str(e)[:50]}"))
                     return
-                
-                # Process each page
+
                 if not images:
                     self.skipped.append((filename, "PDF has no pages"))
                     return
-                
-                all_text = ""
-                for page_num, image in enumerate(images):
-                    text = pytesseract.image_to_string(image, lang='tur+eng')
-                    if text.strip():
-                        all_text += text + "\n"
-                
-                text = all_text
+
+                total_pages = len(images)
+                for page_num, image in enumerate(images, start=1):
+                    page_text = pytesseract.image_to_string(image, lang='tur+eng')
+                    if total_pages > 1:
+                        page_label = f"{filename} (sayfa {page_num}/{total_pages})"
+                    else:
+                        page_label = filename
+                    self._process_page_text(page_text, page_label)
             else:
-                # Regular image file
                 image = Image.open(file_path)
                 text = pytesseract.image_to_string(image, lang='tur+eng')
-
-            if not text.strip():
-                self.skipped.append((filename, "Text extraction failed - too blurry or unreadable"))
-                return
-
-            # Parse receipt
-            receipt, field_count, found_fields = self._parse_text(text, filename)
-
-            if receipt:
-                self.receipts.append(receipt)
-            else:
-                missing = [f for f in CSV_HEADERS if f not in found_fields]
-                clean_text = text.strip()
-                if len(clean_text) > 700:
-                    text_preview = clean_text[:400].replace('\n', ' | ') + " [...] " + clean_text[-300:].replace('\n', ' | ')
-                else:
-                    text_preview = clean_text.replace('\n', ' | ')
-                reason = f"{field_count}/9 alan bulundu. Eksik: {', '.join(missing)}. OCR metni: \"{text_preview}\""
-                self.skipped.append((filename, reason))
+                self._process_page_text(text, filename)
 
         except Exception as e:
             self.skipped.append((filename, f"Error: {str(e)[:50]}"))
+
+    def _process_page_text(self, text: str, label: str) -> None:
+        """Parse the OCR text of ONE page/image as ONE receipt and record the result."""
+        if not text.strip():
+            self.skipped.append((label, "Text extraction failed - too blurry or unreadable"))
+            return
+
+        receipt, field_count, found_fields = self._parse_text(text, label)
+
+        clean_text = text.strip()
+        if len(clean_text) > 700:
+            text_preview = clean_text[:400].replace('\n', ' | ') + " [...] " + clean_text[-300:].replace('\n', ' | ')
+        else:
+            text_preview = clean_text.replace('\n', ' | ')
+
+        if receipt:
+            self.receipts.append(receipt)
+            # Debug note for successful extractions too, so we can verify
+            # parsed values against the raw OCR text without needing a
+            # failure to see what OCR actually read.
+            self.extraction_notes.append({
+                'file': label,
+                'field_count': field_count,
+                'values': {k: v for k, v in receipt.items() if v},
+                'ocr_preview': text_preview
+            })
+        else:
+            missing = [f for f in CSV_HEADERS if f not in found_fields]
+            reason = f"{field_count}/9 alan bulundu. Eksik: {', '.join(missing)}. OCR metni: \"{text_preview}\""
+            self.skipped.append((label, reason))
 
     def _parse_text(self, text: str, source: str) -> Dict | None:
         """
@@ -359,7 +375,8 @@ class ReceiptProcessor:
         return {
             'extracted': len(self.receipts),
             'skipped': len(self.skipped),
-            'skipped_details': [{'file': f, 'reason': r} for f, r in self.skipped]
+            'skipped_details': [{'file': f, 'reason': r} for f, r in self.skipped],
+            'extracted_details': self.extraction_notes
         }
 
 
@@ -886,16 +903,26 @@ HTML_TEMPLATE = """
             document.getElementById('skippedCount').textContent = summary.skipped;
 
             const skippedDetails = document.getElementById('skippedDetails');
-            if (summary.skipped_details.length > 0) {
-                let html = '<div class="skipped-list"><strong>Atlanmış dosyalar:</strong>';
-                summary.skipped_details.forEach(item => {
-                    html += `<div class="skipped-item"><strong>${item.file}</strong>: ${item.reason}</div>`;
+            let detailsHtml = '';
+
+            if (summary.extracted_details && summary.extracted_details.length > 0) {
+                detailsHtml += '<div class="skipped-list"><strong>Çıkarılan fişler:</strong>';
+                summary.extracted_details.forEach(item => {
+                    const vals = Object.entries(item.values).map(([k, v]) => `${k}: ${v}`).join(', ');
+                    detailsHtml += `<div class="skipped-item" style="border-left-color:#4CAF50"><strong>${item.file}</strong> (${item.field_count}/9): ${vals}</div>`;
                 });
-                html += '</div>';
-                skippedDetails.innerHTML = html;
-            } else {
-                skippedDetails.innerHTML = '';
+                detailsHtml += '</div>';
             }
+
+            if (summary.skipped_details.length > 0) {
+                detailsHtml += '<div class="skipped-list"><strong>Atlanmış dosyalar:</strong>';
+                summary.skipped_details.forEach(item => {
+                    detailsHtml += `<div class="skipped-item"><strong>${item.file}</strong>: ${item.reason}</div>`;
+                });
+                detailsHtml += '</div>';
+            }
+
+            skippedDetails.innerHTML = detailsHtml;
 
             const downloadLink = document.getElementById('downloadLink');
             downloadLink.href = data.csv_url;

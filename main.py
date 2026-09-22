@@ -114,8 +114,12 @@ class ReceiptProcessor:
                 self.receipts.append(receipt)
             else:
                 missing = [f for f in CSV_HEADERS if f not in found_fields]
-                text_preview = text.strip()[:200].replace('\n', ' | ')
-                reason = f"{field_count}/9 alan bulundu. Eksik: {', '.join(missing[:4])}. OCR metni: \"{text_preview}\""
+                clean_text = text.strip()
+                if len(clean_text) > 700:
+                    text_preview = clean_text[:400].replace('\n', ' | ') + " [...] " + clean_text[-300:].replace('\n', ' | ')
+                else:
+                    text_preview = clean_text.replace('\n', ' | ')
+                reason = f"{field_count}/9 alan bulundu. Eksik: {', '.join(missing)}. OCR metni: \"{text_preview}\""
                 self.skipped.append((filename, reason))
 
         except Exception as e:

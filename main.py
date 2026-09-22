@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Fiş PDF Aktarım Aracı (Receipt PDF Transfer Tool)
-FastAPI web application for converting receipt images/PDFs to accounting CSV
-"""
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import os, csv, tempfile, re
@@ -33,17 +28,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.pdf', '.JPG', '.JPEG', '.PNG', '.PDF'}
 
-CSV_HEADERS = [
-    'EVRAK TARİHİ',
-    'EVRAK NO',
-    'TCKN/VKN',
-    'SOYADI ÜNVAN',
-    'ADI DEVAMI',
-    'TUTAR',
-    'KDV ORANI',
-    'KDV TUTARI',
-    'TOPLAM TUTAR'
-]
+CSV_HEADERS = ['EVRAK TARİHİ', 'EVRAK NO', 'TCKN/VKN', 'SOYADI ÜNVAN', 'ADI DEVAMI', 'TUTAR', 'KDV ORANI', 'KDV TUTARI', 'TOPLAM TUTAR']
 
 class ReceiptProcessor:
     def __init__(self):
@@ -70,102 +55,79 @@ class ReceiptProcessor:
 
     def _parse_text(self, text: str, source: str) -> Dict | None:
         receipt = {field: '' for field in CSV_HEADERS}
-        print(f"\n{'='*60}")
-        print(f"DEBUG: {source}")
-        print(f"Length: {len(text)} chars")
-        print(f"Full text:\n{text}")
-        print(f"{'='*60}\n")
-        
         field_count = 0
         
-        date_match = re.search(r'\b(\d{1,2})[./\-](\d{1,2})[./\-](\d{4})\b', text)
+        # Date: 25-08-2026 or 25/08/2026 format
+        date_match = re.search(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', text)
         if date_match:
             day, month, year = date_match.groups()
-            if 1 <= int(day) <= 31 and 1 <= int(month) <= 12 and 2000 <= int(year) <= 2099:
-                receipt['EVRAK TARİHİ'] = f"{day:>02s}/{month:>02s}/{year}"
+            if 1 <= int(day) <= 31 and 1 <= int(month) <= 12:
+                receipt['EVRAK TARİHİ'] = f"{int(day):02d}/{int(month):02d}/{year}"
                 field_count += 1
         
-        vkn_match = re.search(r'\b(\d{10,11})\b', text)
+        # Tax ID: 10-11 digits (VD: 0450017361 or similar)
+        vkn_match = re.search(r'(?:VD|Vergi Dairesi|TCKN|VKN)[\s:]*(\d{10,11})', text, re.IGNORECASE)
         if vkn_match:
             receipt['TCKN/VKN'] = vkn_match.group(1)
             field_count += 1
+        else:
+            # Fallback: any 10-11 digit number
+            vkn_fallback = re.search(r'\b(\d{10,11})\b', text)
+            if vkn_fallback:
+                receipt['TCKN/VKN'] = vkn_fallback.group(1)
+                field_count += 1
         
-        no_match = re.search(r'(?:Belge No|Evrak No|No|Fiş No)[:\s]+([A-Za-z0-9\-]{2,20})', text, re.IGNORECASE)
+        # Receipt number: FİŞ NO: 101
+        no_match = re.search(r'FİŞ\s+NO\s*[:]*\s*(\d+)', text, re.IGNORECASE)
         if no_match:
-            receipt['EVRAK NO'] = no_match.group(1).strip()
+            receipt['EVRAK NO'] = no_match.group(1)
             field_count += 1
         
+        # Company name: First non-header line
         lines = text.split('\n')
-        for i, line in enumerate(lines):
-            line_clean = line.strip()
-            if 3 < len(line_clean) < 100 and not re.match(r'^\d+[.,]?\d*$', line_clean):
-                if not any(h in line_clean.upper() for h in ['TOPLAM', 'TUTAR', 'KDV', 'EVRAK', 'TARİH']):
-                    receipt['SOYADI ÜNVAN'] = line_clean[:50]
+        for line in lines:
+            line = line.strip()
+            if 3 < len(line) < 100 and not re.match(r'^\d+', line):
+                if not any(x in line.upper() for x in ['TOPLAM', 'TUTAR', 'KDV', 'TARİH', 'SAAt']):
+                    receipt['SOYADI ÜNVAN'] = line[:50]
                     field_count += 1
                     break
         
-        amount_pattern = r'(?:Tutar|Total|Toplam)[:\s]*([0-9.,]+)'
-        amount_matches = re.findall(amount_pattern, text, re.IGNORECASE)
+        # Amounts: *4.720,00 format (Turkish: . = thousand, , = decimal)
+        # TUTAR line
+        tutar_match = re.search(r'VEDER.*?[*]?([\d.]+,\d{2})', text, re.IGNORECASE)
+        if tutar_match:
+            amt_str = tutar_match.group(1)
+            receipt['TUTAR'] = amt_str
+            field_count += 1
         
-        if amount_matches:
-            amt = self._normalize_amount(amount_matches[-1])
-            if amt:
-                receipt['TUTAR'] = amt
-                field_count += 1
+        # KDV amount: KDV *786,67
+        kdv_match = re.search(r'KDV\s*[*]?([\d.]+,\d{2})', text, re.IGNORECASE)
+        if kdv_match:
+            receipt['KDV TUTARI'] = kdv_match.group(1)
+            field_count += 1
+            
+            # Calculate KDV rate if we have TUTAR
+            if receipt.get('TUTAR'):
+                try:
+                    tutar = float(receipt['TUTAR'].replace('.', '').replace(',', '.'))
+                    kdv_amt = float(kdv_match.group(1).replace('.', '').replace(',', '.'))
+                    if tutar > 0:
+                        rate = (kdv_amt / tutar) * 100
+                        receipt['KDV ORANI'] = f"%{rate:.0f}"
+                        field_count += 1
+                except:
+                    pass
         
-        total_pattern = r'(?:Genel Toplam|TOPLAM TUTAR|Total)[:\s]*([0-9.,]+)'
-        total_matches = re.findall(total_pattern, text, re.IGNORECASE)
-        
-        if total_matches:
-            total = self._normalize_amount(total_matches[-1])
-            if total:
-                receipt['TOPLAM TUTAR'] = total
-                field_count += 1
-        elif amount_matches:
+        # Total: TOP *4.720,00
+        top_match = re.search(r'TOP\s*[*]?([\d.]+,\d{2})', text, re.IGNORECASE)
+        if top_match:
+            receipt['TOPLAM TUTAR'] = top_match.group(1)
+            field_count += 1
+        elif receipt.get('TUTAR'):
             receipt['TOPLAM TUTAR'] = receipt['TUTAR']
         
-        vat_pattern = r'(?:KDV|VAT|Vergi)[:\s]*(%?\d+[.,]?\d*\s*%?)'
-        vat_matches = re.findall(vat_pattern, text, re.IGNORECASE)
-        
-        if vat_matches:
-            vat_str = vat_matches[-1].strip()
-            vat_rate = re.sub(r'[^\d.,]', '', vat_str)
-            if vat_rate:
-                receipt['KDV ORANI'] = f"%{vat_rate}" if '%' not in vat_str else vat_str
-                field_count += 1
-        
-        if receipt.get('TUTAR') and receipt.get('KDV ORANI'):
-            try:
-                amount_val = float(receipt['TUTAR'].replace('.', '').replace(',', '.'))
-                rate_str = receipt['KDV ORANI'].replace('%', '').replace(',', '.')
-                rate_val = float(rate_str) / 100
-                vat_amount = amount_val * rate_val
-                receipt['KDV TUTARI'] = f"{vat_amount:.2f}".replace('.', ',')
-                field_count += 1
-            except:
-                pass
-        
         return receipt if field_count >= 6 else None
-    
-    def _normalize_amount(self, amount_str: str) -> str:
-        amount_str = amount_str.strip().replace(' ', '')
-        if ',' in amount_str and '.' in amount_str:
-            if amount_str.rindex(',') > amount_str.rindex('.'):
-                amount_str = amount_str.replace('.', '').replace(',', '.')
-        elif ',' in amount_str:
-            amount_str = amount_str.replace(',', '.')
-        try:
-            float(amount_str)
-            return amount_str
-        except:
-            return None
-
-    def add_manual_receipt(self, data: Dict[str, str]) -> bool:
-        receipt = {field: data.get(field, '') for field in CSV_HEADERS}
-        if not receipt.get('EVRAK TARİHİ'):
-            return False
-        self.receipts.append(receipt)
-        return True
 
     def export_csv(self, output_path: str) -> None:
         with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:

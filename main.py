@@ -275,7 +275,20 @@ class ReceiptProcessor:
         # the comma. Rejecting any match immediately followed by another
         # digit forces us to correctly recognize this as NOT a clean
         # decimal amount, rather than silently extracting the wrong value.
-        AMOUNT_TOKEN = r'(?:\d{1,3}(?:\.\d{3})+,\s?\d{2}|\d{1,6},\s?\d{2})(?!\d)'
+        # Allow an optional stray OCR space after the thousands-separator
+        # dot too (e.g. "4. 720,00"), not just before the final decimal
+        # digits - otherwise the leading "4." thousands group gets dropped
+        # entirely and "4.720,00" (4720) is silently misread as "720,00"
+        # (720), a full order-of-magnitude error.
+        # The thousands-group separator is accepted as EITHER "." (correct
+        # Turkish notation) OR "," (a very common OCR misread of the dot on
+        # thermal receipts) - but the final decimal separator right before
+        # the last 2 digits must always be a literal ",". This is still
+        # strict about digit counts (exactly 3 per thousands group, exactly
+        # 2 decimals) and the trailing (?!\d) guard, so it doesn't swallow
+        # an unrelated run of digits - it only widens which punctuation
+        # character is tolerated as the grouping separator.
+        AMOUNT_TOKEN = r'(?:\d{1,3}(?:[.,]\s?\d{3})+,\s?\d{2}|\d{1,6},\s?\d{2})(?!\d)'
         # KDV is frequently OCR'd as "KDY", "KOV", or with a stray space
         # inserted inside it ("K DY") on blurry/crumpled thermal receipts.
         KDV_KW = r'K\s*D\s*[VY]|VAT|Vergi'
@@ -431,20 +444,36 @@ class ReceiptProcessor:
         """
         amount_str = amount_str.strip().replace(' ', '')
 
-        # Figure out if this already looks like Turkish format
-        # (period=thousands, comma=decimal) or needs no change.
-        if ',' in amount_str and '.' in amount_str:
-            if amount_str.rindex(',') < amount_str.rindex('.'):
-                # Comma appears before dot - actually English format
-                # (comma=thousands, dot=decimal); convert to Turkish.
+        comma_count = amount_str.count(',')
+        dot_count = amount_str.count('.')
+
+        if comma_count >= 1 and dot_count >= 1:
+            # Mixed separators - whichever one appears LAST is the real
+            # decimal separator; anything before it is a thousands group.
+            if amount_str.rindex(',') > amount_str.rindex('.'):
+                # Comma is last -> already Turkish format, keep as-is.
+                pass
+            else:
+                # Dot is last -> English format (comma=thousands,
+                # dot=decimal); convert to Turkish.
                 amount_str = amount_str.replace(',', '').replace('.', ',')
-            # else: already Turkish format (dot thousands, comma decimal) - keep as is
-        elif '.' in amount_str and ',' not in amount_str:
-            # Only a dot - ambiguous, but for a receipt amount this is far
-            # more likely a decimal point (English-style OCR read) than a
-            # thousands separator, so treat it as the decimal separator.
+        elif comma_count >= 2:
+            # Multiple commas, no dots at all - OCR misread every "."
+            # thousands separator as "," too (e.g. "5,650,00" meaning
+            # 5.650,00). Every comma except the LAST one is a thousands
+            # group; only the last is the real decimal separator.
+            parts = amount_str.split(',')
+            amount_str = '.'.join(parts[:-1]) + ',' + parts[-1]
+        elif dot_count >= 2:
+            # Symmetric case: multiple dots, no commas - last dot is decimal.
+            parts = amount_str.split('.')
+            amount_str = '.'.join(parts[:-1]) + ',' + parts[-1]
+        elif dot_count == 1 and comma_count == 0:
+            # Only a single dot - ambiguous, but for a receipt amount this
+            # is far more likely a decimal point (English-style OCR read)
+            # than a thousands separator, so treat it as the decimal.
             amount_str = amount_str.replace('.', ',')
-        # else: only comma, or no separator at all - already fine as Turkish format
+        # else: exactly one comma and no dot - already correct Turkish format
 
         # Validate it's a real number by parsing it as a float
         try:

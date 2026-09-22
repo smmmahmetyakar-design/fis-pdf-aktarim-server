@@ -215,37 +215,53 @@ class ReceiptProcessor:
                     break
 
         # Pattern 5: Amounts - look for currency values
-        # Turkish format: number with comma as decimal (1.234,56) or just (1234,56)
-        # A properly-formed amount token: 1-3 digits, optional .XXX thousand
-        # groups, comma, then exactly 2 decimal digits (allowing a stray OCR
-        # space before the decimals, e.g. "650, 00").
-        AMOUNT_TOKEN = r'\d{1,3}(?:\.\d{3})*,\s?\d{2}'
+        # Turkish format: number with comma as decimal (1.234,56) or just
+        # (1234,56 - no thousands separator at all, common on smaller
+        # receipts). Allows a stray OCR space before the decimals, e.g.
+        # "650, 00".
+        AMOUNT_TOKEN = r'(?:\d{1,3}(?:\.\d{3})+,\s?\d{2}|\d{1,6},\s?\d{2})'
+        # KDV is frequently OCR'd as "KDY", "KOV", or with a stray space
+        # inserted inside it ("K DY") on blurry/crumpled thermal receipts.
+        KDV_KW = r'K\s*D\s*[VY]|VAT|Vergi'
+        # TOPLAM is frequently truncated/garbled down to just "TOP".
+        TOPLAM_KW = r'Genel\s*Toplam|TOPLAM\s*TUTAR|Toplam|Total|TOP\b'
 
-        amount_pattern = rf'(?:Tutar|Total|Toplam)[:\s]*({AMOUNT_TOKEN})'
+        amount_pattern = rf'(?:Tutar|Ara\s*Toplam)[^\d]{{0,8}}({AMOUNT_TOKEN})'
         amount_matches = re.findall(amount_pattern, text, re.IGNORECASE)
 
-        total_pattern = rf'(?:Genel\s*Toplam|TOPLAM\s*TUTAR|Toplam|Total)[:\s]*({AMOUNT_TOKEN})'
+        total_pattern = rf'(?:{TOPLAM_KW})[^\d]{{0,8}}({AMOUNT_TOKEN})'
         total_matches = re.findall(total_pattern, text, re.IGNORECASE)
 
-        # Cross-check / fallback: OCR frequently garbles "TOPLAM" beyond
-        # recognition (e.g. "TOP", "T0P4AM") on crumpled thermal receipts,
-        # but the actual total amount tends to print 2-3 times on the
-        # receipt (item line, totals line, payment line) and survives OCR
-        # better than the keyword next to it. If no keyword match was found,
-        # or as a sanity check, use the most frequently repeated amount.
+        # Cross-check: OCR frequently inserts stray digit+comma noise right
+        # next to a keyword (e.g. "TOP ¥5, 650,00" gets misread as "5, 65"
+        # instead of "650,00"), so a keyword-adjacent match is NOT trusted
+        # blindly. The actual total amount tends to print 2-3 times on the
+        # receipt (item line, totals line, payment line) and a properly
+        # repeated value is stronger evidence than a keyword-adjacent one -
+        # it takes priority whenever it exists.
         bare_amounts = re.findall(rf'\b({AMOUNT_TOKEN})\b', text)
         if bare_amounts:
             normalized_bare = [a.replace(' ', '') for a in bare_amounts]
             from collections import Counter
             most_common, count = Counter(normalized_bare).most_common(1)[0]
-            if count >= 2 and not total_matches:
+            if count >= 2:
                 total_matches = [most_common]
 
-        # VAT pattern - look for KDV percentage and amount (KDV often OCR'd as KDY/KOV)
-        kdt_rate_pattern = r'(?:KDV|KDY|KOV|VAT|Vergi)[:\s]*%?\s*(\d{1,2}(?:[.,]\d+)?)\s*%?'
-        vat_rate_matches = re.findall(kdt_rate_pattern, text, re.IGNORECASE)
+        # VAT rate - only counted when a literal % sign is actually present
+        # next to the number, so we don't mistake a chunk of an amount for
+        # a rate (e.g. "833,33" must never be read as a "%83" rate).
+        vat_rate_pattern = (
+            rf'(?:{KDV_KW})[^\d%]{{0,6}}%\s*(\d{{1,2}}(?:[.,]\d+)?)'
+            rf'|(?:{KDV_KW})[^\d%]{{0,6}}(\d{{1,2}})\s*%'
+        )
+        vat_rate_matches = re.findall(vat_rate_pattern, text, re.IGNORECASE)
 
-        # Extract amount (before tax)
+        # VAT amount - some receipts print the KDV amount directly instead
+        # of (or in addition to) the rate, e.g. "KDV: 833,33".
+        vat_amount_pattern = rf'(?:{KDV_KW})[^\d%]{{0,8}}({AMOUNT_TOKEN})'
+        vat_amount_matches = re.findall(vat_amount_pattern, text, re.IGNORECASE)
+
+        # Extract amount (before tax), if explicitly labeled
         if amount_matches:
             amt = self._normalize_amount(amount_matches[-1])
             if amt:
@@ -260,42 +276,76 @@ class ReceiptProcessor:
                 receipt['TOPLAM TUTAR'] = total
                 field_count += 1
                 found_fields.append('TOPLAM TUTAR')
-        if not receipt.get('TOPLAM TUTAR') and receipt.get('TUTAR'):
-            # If no explicit total, use the amount found
-            receipt['TOPLAM TUTAR'] = receipt['TUTAR']
-        elif not receipt.get('TUTAR') and receipt.get('TOPLAM TUTAR'):
-            # If no explicit pre-tax amount, use the total found
-            receipt['TUTAR'] = receipt['TOPLAM TUTAR']
-            if 'TUTAR' not in found_fields:
+
+        # Extract VAT rate (only if a real % sign was found)
+        if vat_rate_matches:
+            # findall with multiple groups returns tuples; take whichever
+            # side of the alternation matched (the non-empty one)
+            last = vat_rate_matches[-1]
+            vat_str = (last[0] or last[1]) if isinstance(last, tuple) else last
+            vat_rate = re.sub(r'[^\d.,]', '', vat_str.strip())
+            if vat_rate:
+                receipt['KDV ORANI'] = f"%{vat_rate}"
+                field_count += 1
+                found_fields.append('KDV ORANI')
+
+        # Extract VAT amount directly, if labeled (independent of rate)
+        direct_kdv_amount = None
+        if vat_amount_matches:
+            direct_kdv_amount = self._normalize_amount(vat_amount_matches[-1])
+
+        # --- Reconcile whichever combination of TUTAR / TOPLAM / KDV ORANI /
+        # KDV TUTARI we actually found, filling in the rest by calculation.
+        try:
+            tutar_val = self._to_float(receipt['TUTAR']) if receipt.get('TUTAR') else None
+            toplam_val = self._to_float(receipt['TOPLAM TUTAR']) if receipt.get('TOPLAM TUTAR') else None
+            rate_val = None
+            if receipt.get('KDV ORANI'):
+                rate_val = float(receipt['KDV ORANI'].replace('%', '').replace(',', '.'))
+            kdv_val = self._to_float(direct_kdv_amount) if direct_kdv_amount else None
+
+            if kdv_val is None and tutar_val is not None and rate_val is not None:
+                # Have base amount + rate -> derive KDV amount and total
+                kdv_val = round(tutar_val * rate_val / 100, 2)
+                if toplam_val is None:
+                    toplam_val = round(tutar_val + kdv_val, 2)
+            elif kdv_val is not None and toplam_val is not None and tutar_val is None:
+                # Have total + KDV amount -> derive base amount and rate
+                tutar_val = round(toplam_val - kdv_val, 2)
+                if rate_val is None and tutar_val > 0:
+                    rate_val = round(kdv_val / tutar_val * 100, 2)
+            elif kdv_val is not None and tutar_val is not None and toplam_val is None:
+                # Have base amount + KDV amount -> derive total and rate
+                toplam_val = round(tutar_val + kdv_val, 2)
+                if rate_val is None and tutar_val > 0:
+                    rate_val = round(kdv_val / tutar_val * 100, 2)
+            elif toplam_val is not None and tutar_val is None:
+                # No VAT info at all - assume TUTAR equals TOPLAM (no split available)
+                tutar_val = toplam_val
+            elif tutar_val is not None and toplam_val is None:
+                toplam_val = tutar_val
+
+            def fmt(v):
+                return f"{v:.2f}".replace('.', ',') if v is not None else ''
+
+            if tutar_val is not None and 'TUTAR' not in found_fields:
+                receipt['TUTAR'] = fmt(tutar_val)
                 field_count += 1
                 found_fields.append('TUTAR')
-
-        # Extract VAT rate
-        if vat_rate_matches:
-            vat_str = vat_rate_matches[-1].strip()
-            # Clean up the VAT rate string
-            vat_rate = re.sub(r'[^\d.,]', '', vat_str)
-            if vat_rate:
-                # Ensure it looks like a percentage
-                if '.' not in vat_rate or vat_rate.count('.') == 1:
-                    receipt['KDV ORANI'] = f"%{vat_rate}" if '%' not in vat_str else vat_str
-                    field_count += 1
-                    found_fields.append('KDV ORANI')
-
-        # Calculate VAT amount if we have rate and amount
-        # (receipt['TUTAR'] is stored in Turkish format, e.g. "650,00" or
-        # "1.234,56" - use _to_float to parse it correctly)
-        if receipt.get('TUTAR') and receipt.get('KDV ORANI'):
-            try:
-                amount_val = self._to_float(receipt['TUTAR'])
-                rate_str = receipt['KDV ORANI'].replace('%', '').replace(',', '.')
-                rate_val = float(rate_str) / 100
-                vat_amount = amount_val * rate_val
-                receipt['KDV TUTARI'] = f"{vat_amount:.2f}".replace('.', ',')
+            if toplam_val is not None and 'TOPLAM TUTAR' not in found_fields:
+                receipt['TOPLAM TUTAR'] = fmt(toplam_val)
+                field_count += 1
+                found_fields.append('TOPLAM TUTAR')
+            if rate_val is not None and 'KDV ORANI' not in found_fields:
+                receipt['KDV ORANI'] = f"%{rate_val:g}"
+                field_count += 1
+                found_fields.append('KDV ORANI')
+            if kdv_val is not None and 'KDV TUTARI' not in found_fields:
+                receipt['KDV TUTARI'] = fmt(kdv_val)
                 field_count += 1
                 found_fields.append('KDV TUTARI')
-            except (ValueError, ZeroDivisionError, TypeError):
-                pass
+        except (ValueError, ZeroDivisionError, TypeError):
+            pass
 
         # Consider a receipt valid if the core identifying fields are present:
         # date, receipt no, tax ID, vendor name, and at least one amount.

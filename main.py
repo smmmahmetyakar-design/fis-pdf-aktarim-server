@@ -108,12 +108,15 @@ class ReceiptProcessor:
                 return
 
             # Parse receipt
-            receipt = self._parse_text(text, filename)
+            receipt, field_count, found_fields = self._parse_text(text, filename)
 
             if receipt:
                 self.receipts.append(receipt)
             else:
-                self.skipped.append((filename, "Could not parse all 9 fields"))
+                missing = [f for f in CSV_HEADERS if f not in found_fields]
+                text_preview = text.strip()[:200].replace('\n', ' | ')
+                reason = f"{field_count}/9 alan bulundu. Eksik: {', '.join(missing[:4])}. OCR metni: \"{text_preview}\""
+                self.skipped.append((filename, reason))
 
         except Exception as e:
             self.skipped.append((filename, f"Error: {str(e)[:50]}"))
@@ -136,6 +139,7 @@ class ReceiptProcessor:
 
         receipt = {field: '' for field in CSV_HEADERS}
         field_count = 0
+        found_fields = []
 
         # Pattern 1: Date in DD/MM/YYYY format (handles both dashes and slashes)
         date_match = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b', text)
@@ -145,24 +149,28 @@ class ReceiptProcessor:
             if 1 <= int(day) <= 31 and 1 <= int(month) <= 12 and 2000 <= int(year) <= 2099:
                 receipt['EVRAK TARİHİ'] = f"{day:>02s}/{month:>02s}/{year}"
                 field_count += 1
+                found_fields.append('EVRAK TARİHİ')
 
         # Pattern 2: Tax ID (TCKN/VKN) - 10 or 11 digit number
         vkn_match = re.search(r'\b(\d{10,11})\b', text)
         if vkn_match:
             receipt['TCKN/VKN'] = vkn_match.group(1)
             field_count += 1
+            found_fields.append('TCKN/VKN')
 
         # Pattern 3: Receipt number (often alphanumeric after "Belge No", "Evrak No", "No:", etc.)
         no_match = re.search(r'(?:Belge No|Evrak No|No|Fiş No)[:\s]+([A-Za-z0-9\-]{2,20})', text, re.IGNORECASE)
         if no_match:
             receipt['EVRAK NO'] = no_match.group(1).strip()
             field_count += 1
+            found_fields.append('EVRAK NO')
         else:
             # Fallback: look for 4-6 digit number
             no_fallback = re.search(r'(?:^|\s)(\d{3,8})(?:\s|$)', text, re.MULTILINE)
             if no_fallback:
                 receipt['EVRAK NO'] = no_fallback.group(1)
                 field_count += 1
+                found_fields.append('EVRAK NO')
 
         # Pattern 4: Vendor name - typically appears early in receipt
         # Look for lines with company/shop names (usually after header/date)
@@ -175,11 +183,13 @@ class ReceiptProcessor:
                 # Check if line looks like vendor name (not just numbers or common receipt headers)
                 if not any(header in line_clean.upper() for header in ['TOPLAM', 'TUTAR', 'KDV', 'EVRAK', 'TARİH']):
                     receipt['SOYADI ÜNVAN'] = line_clean[:50]  # First 50 chars
+                    found_fields.append('SOYADI ÜNVAN')
                     # Try to get continuation from next line if it exists
                     if i + 1 < len(lines) and 3 < len(lines[i + 1].strip()) < 50:
                         next_line = lines[i + 1].strip()
                         if not any(c.isdigit() for c in next_line[:5]):  # Doesn't start with numbers
                             receipt['ADI DEVAMI'] = next_line[:50]
+                            found_fields.append('ADI DEVAMI')
                     vendor_found = True
                     field_count += 1
                     break
@@ -202,6 +212,7 @@ class ReceiptProcessor:
             if amt:
                 receipt['TUTAR'] = amt
                 field_count += 1
+                found_fields.append('TUTAR')
 
         # Extract total amount
         if total_matches:
@@ -209,6 +220,7 @@ class ReceiptProcessor:
             if total:
                 receipt['TOPLAM TUTAR'] = total
                 field_count += 1
+                found_fields.append('TOPLAM TUTAR')
         elif amount_matches:
             # If no explicit total, use last found amount
             receipt['TOPLAM TUTAR'] = receipt['TUTAR']
@@ -223,6 +235,7 @@ class ReceiptProcessor:
                 if '.' not in vat_rate or vat_rate.count('.') == 1:
                     receipt['KDV ORANI'] = f"%{vat_rate}" if '%' not in vat_str else vat_str
                     field_count += 1
+                    found_fields.append('KDV ORANI')
 
         # Calculate VAT amount if we have rate and amount
         if receipt.get('TUTAR') and receipt.get('KDV ORANI'):
@@ -233,6 +246,7 @@ class ReceiptProcessor:
                 vat_amount = amount_val * rate_val
                 receipt['KDV TUTARI'] = f"{vat_amount:.2f}".replace('.', ',')
                 field_count += 1
+                found_fields.append('KDV TUTARI')
             except (ValueError, ZeroDivisionError):
                 pass
 
@@ -240,9 +254,9 @@ class ReceiptProcessor:
         # (some fields like continuation may be optional)
         required_minimum = 6
         if field_count >= required_minimum:
-            return receipt
+            return receipt, field_count, found_fields
 
-        return None
+        return None, field_count, found_fields
 
     def _normalize_amount(self, amount_str: str) -> str:
         """Convert Turkish-format amount to standardized format."""

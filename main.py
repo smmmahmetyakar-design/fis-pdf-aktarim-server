@@ -200,14 +200,33 @@ class ReceiptProcessor:
 
         # Pattern 5: Amounts - look for currency values
         # Turkish format: number with comma as decimal (1.234,56) or just (1234,56)
-        amount_pattern = r'(?:Tutar|Total|Toplam)[:\s]*([0-9.,]+)'
+        # A properly-formed amount token: 1-3 digits, optional .XXX thousand
+        # groups, comma, then exactly 2 decimal digits (allowing a stray OCR
+        # space before the decimals, e.g. "650, 00").
+        AMOUNT_TOKEN = r'\d{1,3}(?:\.\d{3})*,\s?\d{2}'
+
+        amount_pattern = rf'(?:Tutar|Total|Toplam)[:\s]*({AMOUNT_TOKEN})'
         amount_matches = re.findall(amount_pattern, text, re.IGNORECASE)
 
-        total_pattern = r'(?:Genel Toplam|TOPLAM TUTAR|Total)[:\s]*([0-9.,]+)'
+        total_pattern = rf'(?:Genel\s*Toplam|TOPLAM\s*TUTAR|Toplam|Total)[:\s]*({AMOUNT_TOKEN})'
         total_matches = re.findall(total_pattern, text, re.IGNORECASE)
 
-        # VAT pattern - look for KDV percentage and amount
-        kdt_rate_pattern = r'(?:KDV|VAT|Vergi)[:\s]*(%?\d+[.,]?\d*\s*%?)'
+        # Cross-check / fallback: OCR frequently garbles "TOPLAM" beyond
+        # recognition (e.g. "TOP", "T0P4AM") on crumpled thermal receipts,
+        # but the actual total amount tends to print 2-3 times on the
+        # receipt (item line, totals line, payment line) and survives OCR
+        # better than the keyword next to it. If no keyword match was found,
+        # or as a sanity check, use the most frequently repeated amount.
+        bare_amounts = re.findall(rf'\b({AMOUNT_TOKEN})\b', text)
+        if bare_amounts:
+            normalized_bare = [a.replace(' ', '') for a in bare_amounts]
+            from collections import Counter
+            most_common, count = Counter(normalized_bare).most_common(1)[0]
+            if count >= 2 and not total_matches:
+                total_matches = [most_common]
+
+        # VAT pattern - look for KDV percentage and amount (KDV often OCR'd as KDY/KOV)
+        kdt_rate_pattern = r'(?:KDV|KDY|KOV|VAT|Vergi)[:\s]*%?\s*(\d{1,2}(?:[.,]\d+)?)\s*%?'
         vat_rate_matches = re.findall(kdt_rate_pattern, text, re.IGNORECASE)
 
         # Extract amount (before tax)
@@ -225,9 +244,15 @@ class ReceiptProcessor:
                 receipt['TOPLAM TUTAR'] = total
                 field_count += 1
                 found_fields.append('TOPLAM TUTAR')
-        elif amount_matches:
-            # If no explicit total, use last found amount
+        if not receipt.get('TOPLAM TUTAR') and receipt.get('TUTAR'):
+            # If no explicit total, use the amount found
             receipt['TOPLAM TUTAR'] = receipt['TUTAR']
+        elif not receipt.get('TUTAR') and receipt.get('TOPLAM TUTAR'):
+            # If no explicit pre-tax amount, use the total found
+            receipt['TUTAR'] = receipt['TOPLAM TUTAR']
+            if 'TUTAR' not in found_fields:
+                field_count += 1
+                found_fields.append('TUTAR')
 
         # Extract VAT rate
         if vat_rate_matches:
@@ -242,50 +267,70 @@ class ReceiptProcessor:
                     found_fields.append('KDV ORANI')
 
         # Calculate VAT amount if we have rate and amount
+        # (receipt['TUTAR'] is stored in Turkish format, e.g. "650,00" or
+        # "1.234,56" - use _to_float to parse it correctly)
         if receipt.get('TUTAR') and receipt.get('KDV ORANI'):
             try:
-                amount_val = float(receipt['TUTAR'].replace('.', '').replace(',', '.'))
+                amount_val = self._to_float(receipt['TUTAR'])
                 rate_str = receipt['KDV ORANI'].replace('%', '').replace(',', '.')
                 rate_val = float(rate_str) / 100
                 vat_amount = amount_val * rate_val
                 receipt['KDV TUTARI'] = f"{vat_amount:.2f}".replace('.', ',')
                 field_count += 1
                 found_fields.append('KDV TUTARI')
-            except (ValueError, ZeroDivisionError):
+            except (ValueError, ZeroDivisionError, TypeError):
                 pass
 
-        # Consider a receipt valid if we extracted at least 6 of 9 fields
-        # (some fields like continuation may be optional)
-        required_minimum = 6
-        if field_count >= required_minimum:
+        # Consider a receipt valid if the core identifying fields are present:
+        # date, receipt no, tax ID, vendor name, and at least one amount.
+        # KDV rate/amount are bonus - OCR on crumpled/blurry thermal receipts
+        # often can't recover them, but the accountant can fill those by hand
+        # if the rest of the row is correct.
+        core_fields = ['EVRAK TARİHİ', 'EVRAK NO', 'TCKN/VKN', 'SOYADI ÜNVAN']
+        has_core = sum(1 for f in core_fields if f in found_fields) >= 3
+        has_amount = 'TUTAR' in found_fields or 'TOPLAM TUTAR' in found_fields
+        if has_core and has_amount:
             return receipt, field_count, found_fields
 
         return None, field_count, found_fields
 
     def _normalize_amount(self, amount_str: str) -> str:
-        """Convert Turkish-format amount to standardized format."""
-        amount_str = amount_str.strip()
-        # Remove spaces used as thousand separator
-        amount_str = amount_str.replace(' ', '')
-        # Turkish uses comma as decimal separator, dot as thousand separator
-        # Convert to English format first for validation
+        """
+        Clean up an OCR-extracted Turkish-format amount and return it in
+        Turkish format (comma decimal, dot thousands) for the output CSV,
+        e.g. "650,00" or "1.234,56". Returns None if it isn't a valid number.
+        """
+        amount_str = amount_str.strip().replace(' ', '')
+
+        # Figure out if this already looks like Turkish format
+        # (period=thousands, comma=decimal) or needs no change.
         if ',' in amount_str and '.' in amount_str:
-            # Determine which is decimal based on position
-            if amount_str.rindex(',') > amount_str.rindex('.'):
-                # Comma is after dot, so dot is thousand separator
-                amount_str = amount_str.replace('.', '').replace(',', '.')
-            else:
-                # Keep as is
-                pass
-        elif ',' in amount_str:
-            # Only comma - it's the decimal separator
-            amount_str = amount_str.replace(',', '.')
-        # Validate it's a number
+            if amount_str.rindex(',') < amount_str.rindex('.'):
+                # Comma appears before dot - actually English format
+                # (comma=thousands, dot=decimal); convert to Turkish.
+                amount_str = amount_str.replace(',', '').replace('.', ',')
+            # else: already Turkish format (dot thousands, comma decimal) - keep as is
+        elif '.' in amount_str and ',' not in amount_str:
+            # Only a dot - ambiguous, but for a receipt amount this is far
+            # more likely a decimal point (English-style OCR read) than a
+            # thousands separator, so treat it as the decimal separator.
+            amount_str = amount_str.replace('.', ',')
+        # else: only comma, or no separator at all - already fine as Turkish format
+
+        # Validate it's a real number by parsing it as a float
         try:
-            float(amount_str)
+            self._parse_turkish_amount(amount_str)
             return amount_str
         except ValueError:
             return None
+
+    def _parse_turkish_amount(self, amount_str: str) -> float:
+        """Parse a Turkish-format amount string ("1.234,56" or "650,00") into a float."""
+        return float(amount_str.replace('.', '').replace(',', '.'))
+
+    def _to_float(self, amount_str: str) -> float:
+        """Public helper: parse a Turkish-format amount string into a float."""
+        return self._parse_turkish_amount(amount_str)
 
     def add_manual_receipt(self, data: Dict[str, str]) -> bool:
         """Add manually-entered receipt."""

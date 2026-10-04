@@ -41,5 +41,5 @@ docker run -d \
 
 echo "---"
 echo "✅ Güncelleme tamamlandı!"
-echo "📍 URL: http://100.74.86.128:$PORT"
-echo "🏥 Health check: http://100.74.86.128:$PORT/health"
+echo "📍 URL: http://192.168.0.10:$PORT"
+echo "🏥 Health check: http://192.168.0.10:$PORT/health"
